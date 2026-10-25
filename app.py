@@ -3,6 +3,7 @@ from flask import Flask, make_response, jsonify, request
 from pymongo import MongoClient
 from bson import ObjectId
 
+
 import jwt
 import datetime
 from functools import wraps
@@ -39,11 +40,15 @@ def login():
         {'WWW-Authenticate': 'Basic realm = "Login required"'})
 
 
-#================================== JWT decorator ========================
+#JWT decorator
 def jwt_required(func):
     @wraps(func)
     def jwt_required_wrapper(*args, **kwargs):
-        token = request.args.get('token')
+        auth_header = request.headers.get("Authorization", "")
+        token = None
+        
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
 
         if not token:
             return make_response(jsonify({"message": "Token is missing"}), 401)
@@ -54,21 +59,20 @@ def jwt_required(func):
                     algorithms="HS256")
         except:
             return make_response(jsonify({"message":"Token is invalid"}), 401)
-        
+
+        request.user = data
         return func(*args, **kwargs)
 
     return jwt_required_wrapper
 
 
 
-#================================== station routes ========================
+#========= station routes ============
 @app.route("/", methods=["GET"])
 def index():
     return make_response("<h1>Welcome to the EV Charging API</h1>", 200)
 
-
 @app.route("/api/stations", methods=["GET"])
-#@jwt_required
 def show_all_stations():
     
     page_num, page_size = 1, 3
@@ -90,7 +94,6 @@ def show_all_stations():
 
 # fetch by ID
 @app.route("/api/stations/<string:station_id>", methods=["GET"])
-#@jwt_required
 def show_one_station(station_id):
 
     if not ObjectId.is_valid(station_id):
@@ -108,7 +111,6 @@ def show_one_station(station_id):
 
 #GET stations with available chargers
 @app.route("/api/stations/available", methods=["GET"])
-#@jwt_required
 def show_available_stations():
     data_to_return = []
 
@@ -120,7 +122,6 @@ def show_available_stations():
 
 #GET stations filtered by charger type (Ac or Dc)
 @app.route("/api/stations/type/<string:charger_type>", methods=["GET"])
-#@jwt_required
 def show_stations_by_type(charger_type):
     if charger_type not in ["Ac", "Dc"]:
         return make_response(jsonify({"error":"Invalid charger type"}), 400)
@@ -134,7 +135,6 @@ def show_stations_by_type(charger_type):
 
 #GET stations nearby (search by location substring)
 @app.route("/api/stations/nearby/<string:location>", methods=["GET"])
-#@jwt_required
 def show_stations_nearby():
     place = request.args.get('place')
 
@@ -151,7 +151,6 @@ def show_stations_nearby():
 
 #get stations by location / status / min_power
 @app.route("/api/stations/search", methods=["GET"])
-#@jwt_required
 def search_stations():
     query = {}
     location = request.args.get('location')
@@ -178,7 +177,6 @@ def search_stations():
 
 #GET analytics - aggregation of usage and energy
 @app.route("/api/stations/analytics", methods=["GET"])
-#@jwt_required
 def get_analytics():
 
     pipeline = [
@@ -195,10 +193,36 @@ def get_analytics():
         },
         {"$sort": {"_id": 1}}
     ]
+    by_type = list(stations.aggregate(pipeline))
+
+    overall_pipeline = [
+        {
+            "$group": {
+                "_id": None,
+                "num_stations": {"$sum": 1},
+                "total_chargers": {"$sum": "$total_chargers"},
+                "available_chargers": {"$sum": "$available_chargers"},
+                "charging_chargers": {"$sum": "$charging_chargers"},
+                "total_energy_kwh": {"$sum": "$energy_consumption"}
+            }
+        }
+    ]
+
+    overall = list(stations.aggregate(overall_pipeline))
+
+    if overall:
+        overall = overall[0]
+        overall.pop("_id", None)
+        total = overall.get("total_chargers") or 1
+        overall["utilisation_pct"] = round(100 * overall.get("charging_chargers", 0) / total, 2)
+    else:
+        overall = {}
+
+    return make_response(jsonify({"overall": overall, "by_charger_type": by_type}), 200)
+
 
 #GET top stations by energy consumption
-@app.route("/api/stations/top", methods=["GET"])
-#@jwt_required
+@app.route("/api/stations/top-stations", methods=["GET"])
 def get_top_stations():
     n = 5
     if request.args.get('n'):
@@ -211,14 +235,15 @@ def get_top_stations():
 
     return make_response(jsonify(data_to_return), 200)
 
-#post method to add a new station
+#post method to add a new stations
 @app.route("/api/stations", methods=["POST"])
-#@jwt_required
+@jwt_required
 def add_station():
     if "station_name" in request.form and \
         "location" in request.form and "charger_type" in request.form:
         
         new_station = {
+            "station_id": request.form["station_id"],
             "station_name": request.form["station_name"],
             "location": request.form["location"],
             "charger_type": request.form["charger_type"],
@@ -244,7 +269,7 @@ def add_station():
 
 #PUT method to modify an existing station
 @app.route("/api/stations/<string:station_id>", methods=["PUT"])
-#@jwt_required
+@jwt_required
 def edit_station(station_id):
     if not ObjectId.is_valid(station_id):
         return make_response(jsonify({"error":"Invalid station ID"}), 400)
@@ -280,7 +305,7 @@ def edit_station(station_id):
 
 #DELETE method to remove a station (admin only)
 @app.route("/api/stations/<string:station_id>", methods=['DELETE'])
-#@jwt_required
+@jwt_required
 def delete_station(station_id):
 
     if not ObjectId.is_valid(station_id):
@@ -295,6 +320,82 @@ def delete_station(station_id):
 
 #user routes
 #POST /GET /DELETE FAVORITE STATIONS
+@app.route("/api/user/favourites", methods=["GET", "POST", "DELETE"])
+@jwt_required
+def favourites():
+    username = request.user["user"]
+
+    if request.method == "POST":
+        station_id = request.form.get("station_id")
+        if not station_id or not ObjectId.is_valid(station_id):
+            return make_response(jsonify({"error":"Invalid station ID"}), 400)
+        if stations.find_one({"_id": ObjectId(station_id)}) is None:
+            return make_response(jsonify({"error":"Station not found"}), 404)
+
+        users.update_one(
+            {"username": username},
+            {"$addToSet": {"favourites": ObjectId(station_id)}},
+            upsert=True
+        )
+        return make_response(jsonify({"message":"Favourite added"}), 201)
+
+    if request.method == "DELETE":
+        station_id = request.form.get("station_id")
+        if not station_id or not ObjectId.is_valid(station_id):
+            return make_response(jsonify({"error":"Invalid station ID"}), 400)
+
+        users.update_one(
+            {"username": username},
+            {"$pull": {"favourites": ObjectId(station_id)}}
+        )
+        return make_response(jsonify({"message":"Favourite removed"}), 200)
+
+    #GET
+    user_doc = users.find_one({"username": username}) or {}
+    fav_ids = user_doc.get("favourites", [])
+
+    data_to_return = []
+    for station in stations.find({"_id": {"$in": fav_ids}}):
+        station['_id'] = str(station['_id'])
+        data_to_return.append(station)
+
+    return make_response(jsonify(data_to_return), 200)
+
+
+# POST / GET charging history (logged-in user)
+@app.route("/api/user/charging_history", methods=["GET", "POST"])
+@jwt_required
+def charging_history():
+    username = request.user["user"]
+
+    if request.method == "POST":
+        station_id = request.form.get("station_id")
+        if not station_id or not ObjectId.is_valid(station_id):
+            return make_response(jsonify({"error":"Invalid station ID"}), 400)
+
+        entry = {
+            "station_id": ObjectId(station_id),
+            "energy_consumption": float(request.form.get("energy_consumption", 0)),
+            "timestamp": datetime.datetime.now(datetime.UTC)
+        }
+
+        users.update_one(
+            {"username": username},
+            {"$push": {"charging_history": entry}},
+            upsert=True
+        )
+        return make_response(jsonify({"message":"History entry added"}), 201)
+
+    user_doc = users.find_one({"username": username}) or {}
+    history = user_doc.get("charging_history", [])
+
+    for h in history:
+        h["station_id"] = str(h["station_id"])
+        if isinstance(h["timestamp"], datetime.datetime):
+            h["timestamp"] = h["timestamp"].isoformat()
+
+    return make_response(jsonify(history), 200)
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=5001)

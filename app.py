@@ -175,52 +175,6 @@ def search_stations():
 
     return make_response(jsonify(data_to_return), 200)
 
-#GET analytics - aggregation of usage and energy
-@app.route("/api/stations/analytics", methods=["GET"])
-def get_analytics():
-
-    pipeline = [
-        {
-            "$group": {
-                "_id": "$charger_type",
-                "total_stations": {"$sum": 1},
-                "total_chargers": {"$sum": "$total_chargers"},
-                "available_chargers": {"$sum": "$available_chargers"},
-                "charging_chargers": {"$sum": "$charging_chargers"},
-                "total_energy_consumption": {"$sum": "$energy_consumption"},
-                "avg_power_output": {"$avg": "$power_output"}
-            }
-        },
-        {"$sort": {"_id": 1}}
-    ]
-    by_type = list(stations.aggregate(pipeline))
-
-    overall_pipeline = [
-        {
-            "$group": {
-                "_id": None,
-                "num_stations": {"$sum": 1},
-                "total_chargers": {"$sum": "$total_chargers"},
-                "available_chargers": {"$sum": "$available_chargers"},
-                "charging_chargers": {"$sum": "$charging_chargers"},
-                "total_energy_kwh": {"$sum": "$energy_consumption"}
-            }
-        }
-    ]
-
-    overall = list(stations.aggregate(overall_pipeline))
-
-    if overall:
-        overall = overall[0]
-        overall.pop("_id", None)
-        total = overall.get("total_chargers") or 1
-        overall["utilisation_pct"] = round(100 * overall.get("charging_chargers", 0) / total, 2)
-    else:
-        overall = {}
-
-    return make_response(jsonify({"overall": overall, "by_charger_type": by_type}), 200)
-
-
 #GET top stations by energy consumption
 @app.route("/api/stations/top-stations", methods=["GET"])
 def get_top_stations():
